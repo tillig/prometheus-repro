@@ -1,0 +1,524 @@
+server:
+  image:
+    repository: quay.io/prometheus/prometheus
+    tag: v2.28.1
+    pullPolicy: IfNotPresent
+
+  # Docs here explain how to annotate and set up sidecars to use mTLS.
+  # https://istio.io/latest/blog/2020/proxy-cert/
+  # https://github.com/istio/istio/blob/release-1.6/manifests/charts/istio-telemetry/prometheus/templates/deployment.yaml
+  # In newer Istio there are easier ways to do this. For reasons I won't get
+  # into we're stuck on Istio 1.6.x.
+  sidecarContainers:
+    istio-proxy:
+      # This will change based on the Istio deployment.
+      image: docker.io/istio/proxyv2:1.6.14
+      ports:
+        - containerPort: 15090
+          name: http-envoy-prom
+          protocol: TCP
+      args:
+        - proxy
+        - sidecar
+        - --domain
+        - $(POD_NAMESPACE).svc.cluster.local
+        - istio-proxy-prometheus
+        - --proxyLogLevel=warning
+        - --proxyComponentLogLevel=misc:error
+        - --controlPlaneAuthPolicy
+        - NONE
+        - --trust-domain=cluster.local
+        - --log_as_json
+      env:
+        - name: OUTPUT_CERTS
+          value: /etc/istio-certs
+        - name: JWT_POLICY
+          value: third-party-jwt
+        - name: PILOT_CERT_PROVIDER
+          value: istiod
+        - name: CA_ADDR
+          value: istiod.istio-system.svc:15012
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: INSTANCE_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        - name: SERVICE_ACCOUNT
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.serviceAccountName
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.hostIP
+        - name: ISTIO_META_MESH_ID
+          value: cluster.local
+        - name: ISTIO_META_CLUSTER_ID
+          value: Kubernetes
+      imagePullPolicy: Always
+      readinessProbe:
+        failureThreshold: 30
+        httpGet:
+          path: /healthz/ready
+          port: 15020
+          scheme: HTTP
+        initialDelaySeconds: 1
+        periodSeconds: 2
+        successThreshold: 1
+        timeoutSeconds: 1
+      volumeMounts:
+        - mountPath: /var/run/secrets/istio
+          name: istiod-ca-cert
+        - mountPath: /etc/istio/proxy
+          name: istio-envoy
+        - mountPath: /var/run/secrets/tokens
+          name: istio-token
+        - mountPath: /etc/istio-certs/
+          name: istio-certs
+        - mountPath: /etc/istio/config
+          name: istio-config-volume
+        - mountPath: /etc/istio/pod
+          name: istio-pod
+
+  extraArgs:
+    log.level: debug
+
+  extraVolumeMounts:
+    - name: istio-certs
+      mountPath: /etc/istio-certs
+
+  extraVolumes:
+    - name: istio-config-volume
+      configMap:
+        defaultMode: 420
+        name: istio
+        optional: true
+    - name: istio-certs
+      emptyDir:
+        medium: Memory
+    - name: istio-envoy
+      emptyDir:
+        medium: Memory
+    - name: istio-token
+      projected:
+        defaultMode: 420
+        sources:
+          - serviceAccountToken:
+              audience: istio-ca
+              expirationSeconds: 43200
+              path: istio-token
+    - name: istiod-ca-cert
+      configMap:
+        defaultMode: 420
+        name: istio-ca-root-cert
+    - name: istio-pod
+      downwardAPI:
+        defaultMode: 420
+        items:
+          - path: labels
+            fieldRef:
+              fieldPath: metadata.labels
+          - path: annotations
+            fieldRef:
+              fieldPath: metadata.annotations
+
+  ## Using 'Recreate' because upgrades get hung on mounting the persistent
+  ## volume and fail to complete if it's a rolling upgrade.
+  strategy:
+    type: Recreate
+
+  persistentVolume:
+    size: 4Gi
+
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+
+alertmanager:
+  enabled: false
+
+serverFiles:
+  prometheus.yml:
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets:
+              - localhost:9090
+
+      - job_name: "kubernetes-apiservers"
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels:
+              [
+                __meta_kubernetes_namespace,
+                __meta_kubernetes_service_name,
+                __meta_kubernetes_endpoint_port_name,
+              ]
+            action: keep
+            regex: default;kubernetes;https
+
+      - job_name: "kubernetes-nodes"
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+
+      - job_name: "kubernetes-nodes-cadvisor"
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+
+      - job_name: "kubernetes-service-endpoints"
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+            action: replace
+            target_label: __scheme__
+            regex: (https?)
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              [
+                __address__,
+                __meta_kubernetes_service_annotation_prometheus_io_port,
+              ]
+            action: replace
+            target_label: __address__
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            action: replace
+            target_label: kubernetes_name
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: kubernetes_node
+
+      - job_name: "kubernetes-service-endpoints-slow"
+        scrape_interval: 5m
+        scrape_timeout: 30s
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_scrape_slow]
+            action: keep
+            regex: true
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+            action: replace
+            target_label: __scheme__
+            regex: (https?)
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              [
+                __address__,
+                __meta_kubernetes_service_annotation_prometheus_io_port,
+              ]
+            action: replace
+            target_label: __address__
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            action: replace
+            target_label: kubernetes_name
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: kubernetes_node
+
+      - job_name: "prometheus-pushgateway"
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: service
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_probe]
+            action: keep
+            regex: pushgateway
+
+      - job_name: "kubernetes-services"
+        metrics_path: /probe
+        params:
+          module: [http_2xx]
+        kubernetes_sd_configs:
+          - role: service
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_service_annotation_prometheus_io_probe]
+            action: keep
+            regex: true
+          - source_labels: [__address__]
+            target_label: __param_target
+          - target_label: __address__
+            replacement: blackbox
+          - source_labels: [__param_target]
+            target_label: instance
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: kubernetes_name
+
+      # There are four jobs for pods:
+      # - Pod with Istio mTLS
+      # - Pod with Istio mTLS that needs slower scrape support
+      # - Pod without Istio mTLS
+      # - Pod without Istio mTLS that needs slower scrape support.
+      #
+      # The Istio secure configurations are based on the one that ships with
+      # Istio's default Prometheus.
+      #####
+      # Scrape config for pods: Pod without Istio mTLS
+      #
+      - job_name: "kubernetes-pods"
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # If Istio annotations are present, pod should be scraped by the kubernetes-pods-istio-secure job.
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_sidecar_istio_io_status]
+            action: drop
+            regex: (.+)
+          - source_labels: [__meta_kubernetes_pod_annotation_istio_mtls]
+            action: drop
+            regex: (true)
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+            action: replace
+            regex: (https?)
+            target_label: __scheme__
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Pending|Succeeded|Failed
+            action: drop
+
+      # Scrape config for pods: Pod without Istio mTLS that needs slower scrape support
+      - job_name: "kubernetes-pods-slow"
+        scrape_interval: 5m
+        scrape_timeout: 30s
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # If Istio annotations are present, pod should be scraped by the kubernetes-pods-istio-secure-slow job.
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scrape_slow]
+            action: keep
+            regex: true
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_sidecar_istio_io_status]
+            action: drop
+            regex: (.+)
+          - source_labels: [__meta_kubernetes_pod_annotation_istio_mtls]
+            action: drop
+            regex: (true)
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+            action: replace
+            regex: (https?)
+            target_label: __scheme__
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Pending|Succeeded|Failed
+            action: drop
+
+      ######
+      ###### THIS IS THE BIG ONE!
+      ###### The certificates here are provided by the Istio sidecar
+      ###### and mounted via shared volume. This works under Prometheus
+      ###### v2.20.1 and fails starting v2.21.0
+      # Scrape config for pods: Pod with Istio mTLS
+
+      - job_name: "kubernetes-pods-istio-secure"
+        scheme: https
+        tls_config:
+          ca_file: /etc/istio-certs/root-cert.pem
+          cert_file: /etc/istio-certs/cert-chain.pem
+          key_file: /etc/istio-certs/key.pem
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          # sidecar status annotation is added by sidecar injector and
+          # istio_workload_mtls_ability can be specifically placed on a pod to indicate its ability to receive mtls traffic.
+          - source_labels:
+              [
+                __meta_kubernetes_pod_annotation_sidecar_istio_io_status,
+                __meta_kubernetes_pod_annotation_istio_mtls,
+              ]
+            action: keep
+            regex: (([^;]+);([^;]*))|(([^;]*);(true))
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__] # Only keep address that is host:port
+            action: keep # otherwise an extra target with ':443' is added for https scheme
+            regex: ([^:]+):(\d+)
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod_name
+
+      # Works just like the above - just a longer timeout.
+      # Scrape config for pods: Pod with Istio mTLS that needs slower scrape support
+      - job_name: "kubernetes-pods-istio-secure-slow"
+        scrape_interval: 5m
+        scrape_timeout: 30s
+        scheme: https
+        tls_config:
+          ca_file: /etc/istio-certs/root-cert.pem
+          cert_file: /etc/istio-certs/cert-chain.pem
+          key_file: /etc/istio-certs/key.pem
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels:
+              [__meta_kubernetes_pod_annotation_prometheus_io_scrape_slow]
+            action: keep
+            regex: true
+          # sidecar status annotation is added by sidecar injector and
+          # istio_workload_mtls_ability can be specifically placed on a pod to indicate its ability to receive mtls traffic.
+          - source_labels:
+              [
+                __meta_kubernetes_pod_annotation_sidecar_istio_io_status,
+                __meta_kubernetes_pod_annotation_istio_mtls,
+              ]
+            action: keep
+            regex: (([^;]+);([^;]*))|(([^;]*);(true))
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__] # Only keep address that is host:port
+            action: keep # otherwise an extra target with ':443' is added for https scheme
+            regex: ([^:]+):(\d+)
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod_name
